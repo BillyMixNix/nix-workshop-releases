@@ -1,0 +1,76 @@
+name: Windows beta installation smoke test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out test documentation
+        uses: actions/checkout@v4
+      - name: Download and install frozen VSIX; record evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $report = [ordered]@{
+            date_utc = (Get-Date).ToUniversalTime().ToString('o')
+            release = 'v0.0.4-beta'
+            runner = $env:RUNNER_OS
+            windows = [Environment]::OSVersion.VersionString
+            vscode = $null
+            ollama = 'NOT AVAILABLE'
+            model = 'NOT AVAILABLE'
+            steps = [ordered]@{}
+            limitations = @('VS Code extension activation not tested', 'No VS Code UI or chat automation', 'Ollama/model not provisioned', 'Diff approval, rollback and restart lifecycle not tested')
+          }
+          1..10 | ForEach-Object { $report.steps["$_"] = 'NOT AVAILABLE' }
+          $failed = $false
+          try {
+            $asset = 'nix-workshop-0.0.4.vsix'
+            $url = 'https://github.com/BillyMixNix/nix-workshop-releases/releases/download/v0.0.4-beta/' + $asset
+            Invoke-WebRequest -Uri $url -OutFile $asset -MaximumRedirection 5
+            $expected = '3b86f3b14263b56af06a22b20cff3a86b30e911321b9d6c794296c0875d24cae'
+            $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "VSIX SHA-256 mismatch: $actual" }
+            $report.package_hash = 'PASS'
+            $code = Get-Command code -ErrorAction SilentlyContinue
+            if (-not $code) {
+              $paths = @('C:\Program Files\Microsoft VS Code\bin\code.cmd', 'C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd')
+              $candidate = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if (-not $candidate) {
+                choco install vscode -y --no-progress
+                $candidate = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+              }
+              if (-not $candidate) { throw 'VS Code CLI not found after installation attempt' }
+              $codePath = $candidate
+            } else { $codePath = $code.Source }
+            $report.vscode = (& $codePath --version | Select-Object -First 1)
+            $userData = Join-Path $env:RUNNER_TEMP 'nixworkshop-user'
+            $extensions = Join-Path $env:RUNNER_TEMP 'nixworkshop-extensions'
+            $output = & $codePath --user-data-dir $userData --extensions-dir $extensions --install-extension (Resolve-Path $asset).Path --force 2>&1
+            $installExit = $LASTEXITCODE
+            $report.install_output = ($output | Out-String).Trim()
+            if ($installExit -ne 0) { throw "VS Code install exited $installExit" }
+            $installed = & $codePath --user-data-dir $userData --extensions-dir $extensions --list-extensions --show-versions 2>&1
+            $report.installed_extensions = @($installed)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not list installed extensions' }
+            if (-not ($installed -match 'nix-workshop.*@0\.0\.4')) { throw 'Nix Workshop v0.0.4 not visible in installed extension list' }
+            $report.steps['1'] = 'PASS'
+          } catch {
+            $failed = $true
+            $report.steps['1'] = 'FAIL'
+            $report.error = $_.Exception.Message
+          } finally {
+            $report | ConvertTo-Json -Depth 6 | Set-Content -Path windows-smoke-report.json -Encoding utf8
+            Get-Content windows-smoke-report.json
+          }
+          if ($failed) { exit 1 }
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-report
+          path: windows-smoke-report.json
+          if-no-files-found: warn
